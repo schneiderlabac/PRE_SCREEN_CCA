@@ -1,0 +1,23 @@
+{
+  "_comment": "This is a configuration file for user-specific settings. Each key represents a unique user ID with corresponding configurations. Note: JSON syntax requires double quotes for strings and does not support single quotes or comments (// or #) like other programming languages. Arrays are denoted with square brackets [], and objects (key-value pairs) with curly braces {}.",
+  "_comment2": " The following key is an example configuration for the CCA project. Please replace the placeholder values with your actual paths and settings.",
+  "felix": {
+    "home": "C:/Users/NAME/XYZ",
+    "ukb": "E:/public/UKB DATA",
+    "sharepoint": "C:/Users/NAME/SHAREPOINT",
+    "project_key": "cca",
+    "biobank_key": "ukb",
+    "ukb_scripts": "C:/Users/NAME/PATH_TO_PREPROCESSING_SCRIPTS",
+    "IOI": "C240",
+    "IOIs": [
+      "C240",
+      "C241",
+      "C248",
+      "C249",
+      "C221"
+    ],
+    "DOI": "CCa",
+    "master_table": "meta/Master_TABLE.xlsx",
+    "na_mode": "impute"
+  }
+}

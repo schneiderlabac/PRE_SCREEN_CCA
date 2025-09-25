@@ -1,0 +1,1029 @@
+---
+title: "Table Y"
+output: html_notebook
+---
+
+```{r}
+source("../config.R") #Loads libraries, variables and global function
+```
+
+
+### Ignore for now, used for specific sub analyses
+```{r}
+ 
+if (DOI == "CCA"){
+  DOI_status = 1
+}
+if (DOI == "iCCA"){
+  DOI_status = 2
+}
+if (DOI == "eCCA"){
+  DOI_status = 3
+}
+```
+
+#### Load hesin data (NHS Information on hospital admissions, diagnosis etc)
+```{r}
+#load datasets 
+setwd(sharepoint_ukb)
+df_withdrawals <- read.delim(withdrawals_path) #loads data for which patients have withdrawn consent of data processing
+cols_to_read <- c("eid", "ins_index", "diag_icd10", "diag_icd9") #predefine cols for hesin/hesin_diag to be read
+hesin_diag <- fread(hesin_diag_path, select = cols_to_read) %>% check_and_remove_withdrawals(df_withdrawals)
+
+cols_to_read <- c("eid", "ins_index", "epistart")
+hesin <- fread(hesin_path, select = cols_to_read) %>% check_and_remove_withdrawals(df_withdrawals)
+
+#merge hesin tables (unique identifier for every patient admission by eid + ins_index)
+setkey(hesin_diag, eid, ins_index)
+setkey(hesin, eid, ins_index)
+pat_icds <- merge(hesin_diag, hesin, by = c("eid", "ins_index"), all = TRUE)
+
+#Access file on death causes (reported independently to NHS -> UKB, so there might be additional patients with your IOI in this dataset)
+setwd(sharepoint_ukb)
+death_cause <- read.delim(death_cause_path) %>%
+  select(eid, cause_icd10)
+death_date <- read.delim(death_date_path) %>% 
+  select(eid, date_of_death)
+
+death_info <- merge(death_cause, death_date, by="eid") %>% # Merge the data frames
+  check_and_remove_withdrawals(df_withdrawals)
+rm(hesin, hesin_diag, death_cause, death_date) #Clean up tables no longer in use
+sub_icd <- subset(pat_icds, diag_icd10 %in% IOIs)
+
+#Export sub_icd if running through this multiple times because the part above takes quite some time due to large dfs
+# setwd(sharepoint_ukb)
+# filename <- paste("processed/sub_icd_" ,DOI, ".csv")
+#write.csv(sub_icd, file = filename, row.names = FALSE) 
+```
+
+
+#### Define function subset_hesin to Extract information on DOI, add data on "died from DOI" to "was diagnosed with DOI"
+```{r}
+
+summary_df <- data.frame(icd_code = character(), amount = numeric())
+
+setwd(sharepoint_ukb)
+subset_hesin <- function(IOI, DOI, summary_df) {
+      #Subset for only rows in hesin with icd-code of interest (IOI)
+      sub_icd <- subset(pat_icds, diag_icd10 == IOI)
+      print(paste("Amount of ", IOI, " in UKB w/o death info: ",length(unique(sub_icd$eid))))
+      sub_icd$epistart <- as.Date(sub_icd$epistart, format="%d/%m/%Y") #transform to date       object
+      sub_icd$year <- format(sub_icd$epistart, "%Y") #extract year
+      sub_icd$year <- as.numeric(format(sub_icd$epistart, "%Y"))
+      
+        # the arrange() function sorts the rows in ascending order  based on eid, diag_icd10, and epistart. The is.na(epistart) term ensures that NAs will be sorted to the end. Finally, slice_head(n = 1) picks the first row for each eid and diag_icd10 combination, which will be the row with the earliest epistart or year value.
+      
+      sub_icd <- sub_icd %>%
+        group_by(eid, diag_icd10) %>%
+        arrange(eid, diag_icd10, is.na(epistart), epistart) %>%
+        slice_head(n = 1) %>%
+        ungroup() %>%
+        select(eid, diag_icd10, epistart, year)
+      
+      sub_death <- subset (death_info, cause_icd10 == IOI) #subset death_table
+      sub_death$date_of_death <- as.Date(sub_death$date_of_death, format="%d/%m/%Y")
+      
+      #For those without diagnosis but only death date, use death date 
+      sub <- merge(sub_icd, sub_death , by.x = "eid", by.y = "eid", all.x=TRUE, all.y=TRUE) %>%
+        rename("date_of_diag" = "epistart") %>%
+        mutate(date_of_diag = case_when(is.na(date_of_diag) ~ date_of_death, TRUE ~ date_of_diag))
+      
+      sub <- as.data.frame(sub[!duplicated(sub$eid),]) %>%      # Remove duplicates
+        mutate(diag_icd10 = coalesce(diag_icd10, cause_icd10))  # enter diag info when only "died from info" is available
+        new_row <- data.frame(icd_code = IOI, amount = nrow(sub))
+  summary_df <<- rbind(summary_df, new_row) #feed summary_df
+
+      colnames(sub)[2]<- "status"
+      sub[,2] <- 1                                                                                              
+      print(paste("Amount of ", IOI, " in UKB: ", count(sub)))
+      print(paste("Amount of ", IOI, " in Death Register: ", count(sub_death)))
+      count <- count(sub)
+      sapply(sub, class)
+      
+  return(sub) # Return the sub and sub_grouped dataframes
+}
+
+
+#Execute the function for all IOIs
+df_list <- list()
+for(IOI in IOIs) {
+  df_name <- paste0("sub_", IOI) # Dynamically create a variable name
+  new_df <- subset_hesin(IOI, DOI, summary_df) # Call the function and assign the result to a new dataframe
+  assign(df_name, new_df)
+  df_list[[df_name]] <- new_df
+}
+
+# Combine all dataframes into a single dataframe "sub"
+sub <- do.call(rbind, df_list)
+
+# Calculate the number of duplicated eids in sub
+count_eid_duplications(sub, df_name= "Subset of Patients with DOI")
+
+### Debug Info, use only if needed!
+
+# print(paste("Number of duplicated eids:", duplicated_eids_count))
+# summary_df <- rbind(summary_df, data.frame(icd_code = "duplicated", amount = duplicated_eids_count)) #store duplicated info in summary
+# 
+# df_discard <- df_discard%>% distinct(eid, .keep_all = TRUE)
+
+
+
+
+```
+
+#### Access all eids as well as info on assessment center + date of first visit
+```{r}
+#Access all UKB_eids either from sharepoint
+  #setwd(sharepoint_ukb)
+  #df <- fread("raw/ukb52200.csv", select=c("eid", "53-0.0", "54-0.0"))   
+  #write.csv(df, file="extracted/basic_info.csv", row.names=FALSE)   
+  
+#shortcut using already extracted data
+setwd(sharepoint_ukb)
+  df_basic <- fread("extracted/basic_info.csv") %>% check_and_remove_withdrawals(df_withdrawals)
+  
+#access detailed info on different ukb_assessment centers 
+location <- read_excel(master_table, sheet = "UKB_Center") %>%
+  filter(!grepl("imaging", location_name, ignore.case = TRUE))
+
+#Adapt format of assessment time if not done already
+# #df_basic <- df_basic %>%
+#   rename(assessment = `53-0.0`) %>%  # Change column name of time
+#   rename(location_code = `54-0.0`) %>%  # Change column name of time
+#   mutate(assessment = as.Date(assessment, format = "%Y-%m-%d"))  # Change to date format
+
+# Merge df_basic with sub (which is "raw" df_y) 
+  df_discard <- merge(df_basic, sub, by.x = "eid", by.y = "eid", all.x=TRUE)
+  sapply(df_discard, class)
+  
+# Label all w/o DOI as 0, those with DOI 1 year after first visit as 1, rest as 2 (these will have to be removed, also in df_X)
+  # Replace NA's with 0 in 'status'
+df_discard$status[is.na(df_discard$status)] <- 0
+
+#Create a column that calculates the difference in time between assessment and diagnosis date (all cases with positive difftime (or negative but > -1 have to be discarded))
+df_discard <- df_discard %>%
+  mutate(difftime = ifelse(status == 1, difftime(assessment, date_of_diag, units = "weeks") / 52.25, NA))
+
+#label 2 for all DOI diagnosis previous to UKB assessment
+df_discard <- df_discard %>%
+  mutate(status = case_when(
+    status == 1 & (difftime > 0 | (difftime >= -1 & difftime < 0)) ~ 2, TRUE ~ status),
+  discard = ifelse(status == 2, 1, 0))
+df_discard <- df_discard%>% distinct(eid, .keep_all = TRUE)
+save(df_discard, file=paste(project_path, "/data/dataframes/df_discard.RData", sep=''))
+```
+
+
+#### Filtering of pancreas eids, when selecting Pancreas carcinoma, only done since there was a lot of overlap between Pancreas cancer and eCCA
+```{r}
+# pancreas_eids <- sub %>% select(eid)
+# save(pancreas_eids, file=paste(project_path, "/data/dataframes/pancreas_eids.RData", sep='')) 
+# setwd(project_path)
+# 
+# load("data/dataframes/df_covariates.RData")
+# # 
+# df_age <- df_covariates %>% select(eid,AGE)
+# df_age <- merge(df_age, df_y, by="eid")
+# 
+# df_age <- df_age %>% mutate(age_at_diagnosis = (AGE - difftime))
+# df_age<- df_age %>% select(eid, AGE, age_at_diagnosis)
+# df_age <- df_age[complete.cases(df_age[, c("AGE", "age_at_diagnosis")]),]
+
+```
+
+
+
+
+#### Prepare df_y
+```{r}
+setwd(project_path)
+if (!exists("df_discard")) load("data/dataframes/df_discard.RData") #loads df_discard from project directory (to skip parts above)df_y_icca <- df_y %>% select("eid", "status") %>% filter(status == 1)
+
+df_discard_eids <- df_discard$eid[df_discard$discard == 1]
+# Count and print the number of discarded cases
+doi_discarded <- sum(df_discard$discard)
+print(paste("Number of cases of", DOI, "discarded because of diagnosis before/during assessment time:", doi_discarded))
+
+df_y <- subset(df_discard, status != 2)
+doi_included <- sum(df_y$status)
+print(paste("Number of cases of", DOI, "still available after removing previously diagnosed people:", doi_included))
+df_y_dupes <- df_y[duplicated(df_y$eid)]
+df_y <- df_y[!duplicated(df_y$eid)]
+doi_included <- sum(df_y$status)
+print(paste("Number of", DOI, "still included after removing duplicates:", doi_included))
+
+
+
+pancreas_eids <- pancreas_eids[!(pancreas_eids$eid %in% df_discard_eids),]
+length(unique(pancreas_eids))
+```
+
+### Check cancer registry for overlap with ICD10 coded diagnosis
+
+```{r}
+setwd(sharepoint_ukb)
+df_cancerreg <- fread("raw/ukb677285.csv") %>% check_and_remove_withdrawals(df_withdrawals)
+df_y_only <- read.csv(file.path(project_path, "data", "dataframes", "df_y.csv")) %>%
+  select("eid", "status") %>%
+  subset(status== "1")
+
+df_cancerreg_icd10 <- df_cancerreg %>% select(eid, starts_with("40006")) #Subset for relevant columns for matching with icd10 codes
+
+
+#Extract for every IOI in IOIs the info on occurence in cancer register
+results_list <- list() #Store eids of matched rows in list
+for(IOI in IOIs) {
+  matched_eids <- df_cancerreg_icd10 %>%                    # Filter rows where any of the columns contain the IOI
+    filter(apply(., 1, function(row) any(row == IOI))) %>%
+    pull(eid) 
+  results_list[[paste(IOI, "cancerreg", sep = "_")]] <- matched_eids
+  print(paste("Number of entries for", IOI, ":", length(matched_eids)))
+}
+
+matches_count <- numeric(length(IOIs))
+names(matches_count) <- IOIs # Naming the vector elements after IOIs for clarity
+
+
+
+
+# out of the eids that are extracted above, create a DF with 0 or 1 per IOI
+
+df_y_cancerreg <- data.frame(eid = df_basic$eid)
+for (i in seq_along(results_list)) {
+  # Get the current vector of eids
+  current_eids <- results_list[[i]]
+  column_name <- strsplit(names(results_list)[i], "_")[[1]][1]
+  
+  # Create the new column with 1 if 'eid' is in the current vector, otherwise 0
+  df_y_cancerreg[[column_name]] <- ifelse(df_y_cancerreg$eid %in% current_eids, 1, 0)
+}
+
+# Merge IOIs together (if any = true -> status = true)
+df_y_cancerreg$status_cancerreg <- apply(df_y_cancerreg[IOIs], 1, function(row) {
+  if (any(row == 1)) {
+    return(1)
+  } else {
+    return(0)
+  }
+})
+
+df_y_cancerreg <- df_y_cancerreg %>%
+  select("eid", "status_cancerreg")
+
+
+df_y <- inner_join(df_y, df_y_cancerreg, by = "eid")
+
+
+sum(df_y$status)
+```
+```{r}
+df_y_eids <- df_y %>% select(eid, status, status_cancerreg) %>% filter(status== 1 & status_cancerreg == 1)
+# if (DOI_status == 1|2|3){
+#   setwd(project_path)
+#   if (!exists("df_cancerreg_eids")) load("data/dataframes/df_cancerreg_eids_eids.RData")
+#   df_y_duplicated_eids <- df_cancerreg_eids$eid
+#   df_y <- df_y[(df_y$eid %in% df_y_duplicated_eids),]
+#   doi_included <- sum(df_y$status)
+#   print(paste("Number of ", DOI, "still included after removing filtering with Cancer registry:", doi_included))
+# } 
+# 
+# 
+# df_filtered <- df_y[!(df_y$status == 1 & df_y$status_cancerreg == 0), ]
+```
+
+```{r}
+
+if (DOI == "iCCA"){
+  setwd(project_path)
+  if (!exists("df_y_ecca")) load("data/dataframes/df_y_ecca.RData")
+  if (!exists("df_y_icca")) load("data/dataframes/df_y_icca.RData")
+  df_y_eids <- merge(df_y_ecca, df_y_icca, by= "eid")
+  df_y_duplicated_eids <- df_y_eids$eid
+  df_y <- df_y[!(df_y$eid %in% df_y_duplicated_eids),]
+  doi_included <- sum(df_y$status)
+  print(paste("Number of ", DOI, "still included after removing Overlapping CCa diagnoses", doi_included))
+}
+mean_difftime <- round((mean(df_y$difftime[df_y$status == 1], na.rm = TRUE) * -1), 2)
+print(paste("Average time from assessment to", DOI, ":", mean_difftime, "years"))
+if (DOI == "eCCA"){
+  setwd(project_path)
+  if (!exists("df_y_ecca")) load("data/dataframes/df_y_ecca.RData")
+  if (!exists("df_y_icca")) load("data/dataframes/df_y_icca.RData")
+  df_y_eids <- merge(df_y_ecca, df_y_icca, by= "eid")
+  df_y_duplicated_eids <- df_y_eids$eid
+  df_y <- df_y[!(df_y$eid %in% df_y_duplicated_eids),]
+  doi_included <- sum(df_y$status)
+  print(paste("Number of ", DOI, "still included after removing Overlapping CCa diagnoses", doi_included))
+}
+mean_difftime <- round((mean(df_y$difftime[df_y$status == 1], na.rm = TRUE) * -1), 2)
+print(paste("Average time from assessment to", DOI, ":", mean_difftime, "years"))
+if (DOI_status == 1|2|3){
+  setwd(project_path)
+  if (!exists("pancreas_eids")) load("data/dataframes/pancreas_eids.RData")
+  df_y_duplicated_eids <- pancreas_eids$eid
+  print(paste("Number of patients excluded from pancreas cancer:", nrow(distinct(pancreas_eids, eid))))
+  df_y <- df_y[!(df_y$eid %in% df_y_duplicated_eids),]
+  doi_included <- sum(df_y$status)
+  print(paste("Number of ", DOI, "still included after removing Pancreas Carcinoma diagnoses:", doi_included))
+}  
+mean_difftime <- round((mean(df_y$difftime[df_y$status == 1], na.rm = TRUE) * -1), 2)
+print(paste("Average time from assessment to", DOI, ":", mean_difftime, "years"))
+# if (DOI_status == 1|2|3){
+#   df_y <- df_y[!(df_y$status == 1 & df_y$status_cancerreg == 0), ]
+#   doi_included <- sum(df_y$status)
+#   print(paste("Number of ", DOI, "still included after removing filtering with Cancer registry:", doi_included))
+# }
+mean_difftime <- round((mean(df_y$difftime[df_y$status == 1], na.rm = TRUE) * -1), 2)
+print(paste("Average time from assessment to", DOI, ":", mean_difftime, "years"))
+
+
+```
+
+
+
+
+#### Visualize time of HCC diagnosis and whether patient included in model or not
+
+```{r}
+
+plot_included_discarded_cases(df_discard, base_size=27)
+
+```
+
+
+
+
+
+
+#### Preprocess locations
+```{r}
+# Load the 'world.cities' data
+data("world.cities")
+
+# Create a mapping of city names to latitudes and longitudes
+city_locations <- world.cities %>%
+  filter(country.etc == "UK") %>%
+  select(name, lat, long) %>%
+  rename(location_name = name)
+
+#add manual data for croydon/newcastle, because they miss in the maps dataset
+city_locations <- city_locations %>%
+   rbind(data.frame(location_name = "Barts", lat = 51.5177, long = -0.0968),  # Barts (angenommen, es handelt sich um St Bartholomew's Hospital in London) 
+        data.frame(location_name = "Hounslow", lat = 51.4664, long = -0.3509),  # Hounslow's coordinates
+        data.frame(location_name = "Stoke", lat = 53.0027, long = -2.1799),  # Stoke's coordinates
+        data.frame(location_name = "Croydon", lat = 51.3762, long = -0.0982), # Croydon's coordinates
+        data.frame(location_name = "Newcastle", lat = 54.9784, long = -1.6174)) # Newcastle's coordinates
+
+# Merge a subset of df_y with the location mapping
+df_loc <- df_y[df_y$status==1]
+df_loc <- merge(df_loc, location, by = "location_code", all = TRUE)
+df_loc <- df_loc[!is.na(df_loc$eid)]
+df_loc <- df_loc[!duplicated(df_loc$eid)&!duplicated(df_loc$eid),]
+len <- nrow(df_loc)
+
+#summarize per country
+df_country <- df_loc %>%
+    group_by(location_country) %>%
+    summarise(count = n()) %>%
+    mutate(percentage = (count / len) * 100)
+
+# Count the number of cases in each location
+df_loc_counts <- df_loc %>%
+  group_by(location_name) %>%
+  summarise(count = n())
+
+# Merge the df_loc_counts with the city locations
+df_loc_counts <- merge(df_loc_counts, city_locations, by = "location_name", all.x = TRUE)
+df_loc_counts <- merge(df_loc_counts, location, by = "location_name", all.x = TRUE)
+```
+
+```{r}
+df_y <- df_y %>% mutate(age_at_diag = year - year_of_birth)
+age_at_diag <- df_y$age_at_diag
+age_at_diag <- age_at_diag
+mean_value <- mean(age_at_diag, na.rm = TRUE)
+
+# Calculate standard error with NA removal
+sem <- sd(age_at_diag, na.rm = TRUE) / sqrt(sum(!is.na(age_at_diag)))
+
+# Calculate t-value for 95% CI
+alpha <- 0.05
+t_value <- qt(1 - alpha / 2, df = sum(!is.na(age_at_diag)) - 1)
+
+# Calculate confidence intervals
+lower_ci <- mean_value - (t_value * sem)
+upper_ci <- mean_value + (t_value * sem)
+sd(age_at_diag, na.rm = TRUE)
+# Display results
+cat("Mean:", mean_value, "\n")
+cat("95% Confidence Interval:", lower_ci, "to", upper_ci, "\n")
+```
+
+
+
+# Quality check distribution over locations and create columns for internal and external group splits
+-> External split: Choose ~ 20 % to leave aside while training/hyperparameter tuning for validation in 2nd step. Ideally data from separate countries
+```{r}
+#Define "external validation centers"
+validation <- c("Glasgow", "Edinburgh", "Cardiff", "Swansea", "Wrexham", "Newcastle")
+
+# Merge on location info
+df_y <- merge(df_y, location, by = "location_code", all.x = TRUE)
+
+######## Outer level ############
+df_y$split_ext <- ifelse(df_y$location_name %in% validation, 1, 0)
+
+
+######### Inner level ##########
+# Sort the centers by amount of DOI to achieve even numbers in every fold
+df_loc_train <- df_loc_counts %>%
+  filter(!location_name %in% validation) %>%
+  arrange(desc(count))
+
+num_folds <- 5
+df_loc_train$split_int <- rep(1:num_folds, length.out=nrow(df_loc_train))
+
+sum(df_loc_counts$count) 
+
+# Check "summary_by_fold for even distribution
+summary_by_fold <- df_loc_train %>%
+  group_by(split_int) %>%
+  summarise(centers = paste(location_name, collapse = ", "), 
+            total_count = sum(count))
+print(sum(summary_by_fold$total_count))
+
+summary_by_fold
+
+
+#Add split_int info to df_y
+df_y <- df_y %>%
+  left_join(select(df_loc_train, location_code, split_int), by = "location_code")
+
+
+#Check absolute and relative amounts
+summary_by_level <- df_y %>%
+  filter(status == 1) %>%
+  group_by(split_ext) %>%
+  summarize(
+    count = n(),
+    relative = n() / nrow(filter(df_y, status == 1))
+  )
+
+summary_by_level
+
+split_int <- summary_by_level %>%
+  filter(split_ext == 0) %>%
+  pull(count)
+
+split_ext <- summary_by_level %>%
+  filter(split_ext == 1) %>%
+  pull(count)
+
+df_loc_counts$in_validation <- df_loc_counts$location_name %in% validation
+df_loc_counts$rank <- with(df_loc_counts, order(in_validation, -count))
+df_loc_counts$location_name <- factor(df_loc_counts$location_name, levels = df_loc_counts$location_name[order(df_loc_counts$rank)])
+
+validation
+
+summary_df <- df_y %>% #Group by center and count
+  group_by(location_name) %>%
+  summarise(
+    all = n(),  # Count of all participants in each location
+    cases = sum(status == 1, na.rm = TRUE),  # Count of cases where status == 1
+    ratio = cases / all *100  # Ratio of cases to total
+  )
+
+
+
+
+```
+
+# Visualize locations
+```{r}
+create_map_plot(df_loc_counts, df_country, base_size=14) #See visual in preprocessing_functions
+custom_labels <- paste0(unique(df_country$location_country), " (n=", df_country$count, ")")
+
+
+# Make the bar plot
+plot <- ggplot(df_loc_counts, aes(x = location_name, y = count, fill = location_country)) +
+  geom_col() +
+  scale_fill_manual(values = c("England" = "grey", "Scotland" = "red", "Wales" = "blue"), labels = custom_labels) +
+  coord_flip() +
+  theme_minimal() +
+  labs(title = paste("Number of ", DOI, " Diagnosis in UK Biobank Centers"),
+       x = "Location",
+       y = "Number of Cases",
+       fill = "Country")
+
+print(plot)
+
+
+
+# Save the plots
+ggsave(filename = file.path(supplement_visuals_dir, paste0("barplot_", DOI, "_occurence_per_center.png")), 
+       plot = plot, width = 10, height = 8, bg= "white")
+ggsave(filename = file.path(supplement_visuals_dir, paste0("barplot_", DOI, "_occurence_per_center.svg")), 
+       plot = plot, width = 10, height = 7, bg = "white")
+
+
+```
+
+
+
+
+#### Export all
+```{r}
+write.csv(df_y, file=paste(project_path, "/data/dataframes/df_y.csv", sep=''), row.names=FALSE)
+save(df_y, file=paste(project_path, "/data/dataframes/df_y.RData", sep='')) 
+write.csv(df_loc_counts, file=paste(project_path, "/data/supplement/", DOI, "_per_center.csv", sep=''), row.names=FALSE)
+write.xlsx(summary_df, file=paste0(project_path, "/supplement/", DOI ,"_per_center.xlsx"))
+
+```
+
+
+```{r}
+library("VennDiagram")
+setwd(project_path)
+if (!exists("df_y_ecca")) load("data/dataframes/df_y_ecca.RData")
+if (!exists("df_y_icca")) load("data/dataframes/df_y_icca.RData")
+set1 <- df_y_icca$eid
+set2 <- df_y_ecca$eid 
+setwd(project_path)
+venn.plot <- venn.diagram(
+  x = list(
+    Set1 = set1,
+    Set2 = set2
+  ),
+  category.names = c("iCCA", "eCCA"),
+  filename = "visuals/VennDiagram_Overlap.png", 
+  height = 3000,
+  width = 3000,
+  resolution = 300,# Do not save to file
+  col = "black",  # Border color for the circles
+  fill = c("cornflowerblue", "chartreuse4"),  # Fill colors for the circles
+  alpha = 0.5,  # Transparency level
+  cex = 4,  # Font size for the counts
+  fontfamily = "sans",
+  fontface = "bold",
+  cat.col = c("cornflowerblue", "chartreuse4"),  # Category label colors
+  cat.cex = 5,  # Font size for category labels
+  cat.fontfamily = "sans",
+  cat.fontface = "bold",
+  cat.pos = c(-20, 20),  # Position of category labels
+  cat.dist = c(0.05, 0.05)  # Distance of category labels from the circles
+)
+
+
+```
+
+
+
+
+
+
+#### Random Plots ( for age distribution)
+
+```{r}
+# pancreas_eids <- sub %>% select(eid)
+# save(pancreas_eids, file=paste(project_path, "/data/dataframes/pancreas_eids.RData", sep='')) 
+setwd(project_path)
+
+load("data/dataframes/df_covariates.RData")
+
+df_age <- df_covariates %>% select(eid,AGE)
+df_age <- merge(df_age, df_y, by="eid")
+
+df_age <- df_age %>% mutate(age_at_diagnosis = (AGE - difftime))
+df_age<- df_age %>% select(eid, AGE, age_at_diagnosis)
+df_age <- df_age[complete.cases(df_age[, c("AGE", "age_at_diagnosis")]),]
+ggplot(df_age, aes(x = age_at_diagnosis)) +
+  geom_histogram(binwidth = 1, fill = "skyblue", color = "black", alpha = 0.7) +
+  labs(title = "Histogramm des Alters von Patientinnen",
+       x = "Alter",
+       y = "Anzahl der Patientinnen") +
+  theme_minimal()
+
+
+
+
+ggplot(df_age, aes(x = factor(1:nrow(df_age)), y = AGE)) +
+  geom_point(color = "blue", size = 3) +
+  geom_point(aes(y = age_at_diagnosis), color = "red", size = 3) +
+  geom_segment(aes(xend = factor(1:nrow(df_age)), y = AGE, yend = age_at_diagnosis), 
+               color = "gray", arrow = arrow(length = unit(0.2, "cm"))) +
+  labs(title = "Age at Baseline vs Age at Diagnosis",
+       x = "Patients",
+       y = "Age") +
+  theme_minimal() +
+  theme(axis.text.x = element_blank(),
+        axis.ticks.x = element_blank()) +
+  scale_y_continuous(breaks = seq(0, max(df_age$age_at_diagnosis, na.rm = TRUE), by = 5)) +
+  annotate("text", x = nrow(df_age), y = min(df_age$AGE, na.rm = TRUE), 
+           label = "Blue: Age at Baseline", hjust = 1, vjust = -1, color = "blue") +
+  annotate("text", x = nrow(df_age), y = min(df_age$AGE, na.rm = TRUE) - 2, 
+           label = "Red: Age at Diagnosis", hjust = 1, vjust = -1, color = "red")
+```
+```{r}
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+
+# Calculate age difference
+df_age <- df_age %>%
+  mutate(age_difference = age_at_diagnosis - AGE)
+
+# Function to create plot
+create_plot <- function(data, sort_by, title) {
+  ggplot(data, aes(x = 1:nrow(data), y = AGE)) +
+    geom_point(color = "blue", size = 1, alpha = 0.6) +
+    geom_point(aes(y = age_at_diagnosis), color = "red", size = 1, alpha = 0.6) +
+    geom_segment(aes(xend = 1:nrow(data), y = AGE, yend = age_at_diagnosis), 
+                 color = "gray", alpha = 0.3) +
+    labs(title = title,
+         x = "Patienten",
+         y = "Alter") +
+    theme_minimal() +
+    theme(axis.text.x = element_blank(),
+          axis.ticks.x = element_blank()) +
+    scale_y_continuous(breaks = seq(0, max(data$age_at_diagnosis, na.rm = TRUE), by = 5)) +
+    annotate("text", x = nrow(data), y = min(data$AGE, na.rm = TRUE), 
+             label = "Blau: Alter bei Baseline", hjust = 1, vjust = -1, color = "blue", size = 3) +
+    annotate("text", x = nrow(data), y = min(data$AGE, na.rm = TRUE) - 2, 
+             label = "Rot: Alter bei Diagnose", hjust = 1, vjust = -1, color = "red", size = 3)
+}
+
+# 1. Sorted by age difference
+plot1 <- create_plot(df_age %>% arrange(age_difference), 
+                     "age_difference", 
+                     "Alter bei Baseline vs. Alter bei Diagnose\n(sortiert nach Altersdifferenz)")
+
+# 2. Sorted by age at baseline
+plot2 <- create_plot(df_age %>% arrange(AGE), 
+                     "AGE", 
+                     "Alter bei Baseline vs. Alter bei Diagnose\n(sortiert nach Alter bei Baseline)")
+
+# 3. Sorted by age at diagnosis
+plot3 <- create_plot(df_age %>% arrange(age_at_diagnosis), 
+                     "age_at_diagnosis", 
+                     "Alter bei Baseline vs. Alter bei Diagnose\n(sortiert nach Alter bei Diagnose)")
+
+# Display plots
+print(plot1)
+print(plot2)
+print(plot3)
+
+# Save plots (optional)
+ggsave("plot_by_age_difference.png", plot1, width = 10, height = 6, dpi = 300)
+ggsave("plot_by_baseline_age.png", plot2, width = 10, height = 6, dpi = 300)
+ggsave("plot_by_diagnosis_age.png", plot3, width = 10, height = 6, dpi = 300)
+```
+```{r}
+# Benötigte Bibliotheken laden
+library(ggplot2)
+# Load required libraries
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Prepare data
+df_long <- df_age %>%
+  pivot_longer(cols = c(AGE, age_at_diagnosis),
+               names_to = "type",
+               values_to = "age") %>%
+  mutate(type = factor(type, levels = c("AGE", "age_at_diagnosis"),
+                       labels = c("Age at baseline", "Age at diagnosis")))
+
+# Function to create density plot
+create_density_plot <- function(data, title) {
+  ggplot(data, aes(x = age, fill = type)) +
+    geom_density(alpha = 0.5) +
+    labs(title = title,
+         x = "Age",
+         y = "Density",
+         fill = "Timepoint") +
+    theme_minimal() +
+    scale_fill_manual(values = c("blue", "red")) +
+    scale_x_continuous(breaks = seq(0, max(data$age, na.rm = TRUE), by = 5)) +
+    theme(legend.position = "bottom",
+          text = element_text(size = 16),
+          axis.text = element_text(size = 14),
+          legend.text = element_text(size = 14),
+          plot.title = element_text(size = 20, face = "bold"),
+          axis.title = element_text(size = 18),
+          legend.title = element_text(size = 16))
+}
+
+# Create plots
+plot1 <- create_density_plot(df_long, "Altersverteilung: Baseline vs. Diagnose")
+
+# Histogram with overlaid densities
+plot2 <- ggplot(df_long, aes(x = age, fill = type)) +
+  geom_histogram(aes(y = ..density..), alpha = 0.5, position = "identity", bins = 30) +
+  geom_density(alpha = 0.2) +
+  labs(title = "",
+       x = "",
+       y = "Density",
+       fill = "") +
+  theme_minimal() +
+  scale_fill_manual(values = c("blue", "red")) +
+  scale_x_continuous(breaks = seq(0, max(df_long$age, na.rm = TRUE), by = 5)) +
+  theme(legend.position = "bottom",
+        text = element_text(size = 26),
+        axis.text = element_text(size = 30),
+        legend.text = element_text(size = 30),
+        plot.title = element_text(size = 20, face = "bold"),
+        axis.title = element_text(size = 28),
+        axis.text.x = element_text(size =30 , colour="black", vjust=0.1), 
+        axis.text.y = element_text(size = 30 ,colour="black"),
+        legend.title = element_text(size = 30),
+        panel.grid.major = element_blank(),
+        panel.grid.minor = element_blank(),
+        plot.margin = margin(0.5, 0.5, 0.5, 0.5, "cm"),
+          panel.border = element_rect(colour = "black", fill = NA, linewidth = 1))
+
+# Boxplot
+plot3 <- ggplot(df_long, aes(x = type, y = age, fill = type)) +
+  geom_boxplot() +
+  labs(title = "",
+       x = "Timepoint",
+       y = "Age",
+       fill = "Timepoint") +
+  theme_minimal() +
+  scale_fill_manual(values = c("blue", "red")) +
+  theme(legend.position = "none",
+        text = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        plot.title = element_text(size = 20, face = "bold"),
+        axis.title = element_text(size = 18))
+
+# Display plots
+print(plot1)
+print(plot2)
+print(plot3)
+
+# Save plots (optional)
+setwd(project_path)
+ggsave(filename = file.path(supplement_visuals_dir, paste0("age_density_plot_", DOI, ".svg")), 
+       plot = plot1, width = 12, height = 8,dpi = 300,  bg = "transparent")
+ggsave(filename = file.path(supplement_visuals_dir, paste0("age_histogram_density_plot_", DOI, ".svg")), 
+       plot = plot2, width = 12, height = 8,dpi = 300,  bg = "transparent")
+ggsave("/supplement_visuals/age_boxplot.png", plot3, width = 12, height = 8, dpi = 300)
+```
+```{r}
+# Benötigte Bibliotheken laden
+library(ggplot2)
+library(dplyr)
+library(tidyr)
+
+# Daten vorbereiten
+df_long <- df_age %>%
+  pivot_longer(cols = c(AGE, age_at_diagnosis),
+               names_to = "type",
+               values_to = "age") %>%
+  mutate(type = factor(type, levels = c("AGE", "age_at_diagnosis"),
+                       labels = c("Alter bei Baseline", "Alter bei Diagnose")))
+
+# Histogramm mit Prozentangaben
+plot1 <- ggplot(df_long, aes(x = age, fill = type)) +
+  geom_histogram(aes(y = ..count../sum(..count..)*100), 
+                 position = "identity", alpha = 0.5, bins = 30) +
+  labs(title = "Altersverteilung: Baseline vs. Diagnose",
+       x = "Alter",
+       y = "Prozent der Patienten",
+       fill = "Zeitpunkt") +
+  theme_minimal() +
+  scale_fill_manual(values = c("blue", "red")) +
+  scale_x_continuous(breaks = seq(0, max(df_long$age, na.rm = TRUE), by = 5)) +
+  scale_y_continuous(labels = function(x) paste0(x, "%")) +
+  theme(legend.position = "bottom",
+        text = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        plot.title = element_text(size = 20, face = "bold"),
+        axis.title = element_text(size = 18),
+        legend.title = element_text(size = 16))
+
+# Dichteplot mit "Relative Häufigkeit"
+plot2 <- ggplot(df_long, aes(x = age, fill = type)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Altersverteilung: Baseline vs. Diagnose",
+       x = "Alter",
+       y = "Relative Häufigkeit",
+       fill = "Zeitpunkt") +
+  theme_minimal() +
+  scale_fill_manual(values = c("blue", "red")) +
+  scale_x_continuous(breaks = seq(0, max(df_long$age, na.rm = TRUE), by = 5)) +
+  theme(legend.position = "bottom",
+        text = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        legend.text = element_text(size = 14),
+        plot.title = element_text(size = 20, face = "bold"),
+        axis.title = element_text(size = 18),
+        legend.title = element_text(size = 16))
+
+# Boxplot (unverändert)
+plot3 <- ggplot(df_long, aes(x = type, y = age, fill = type)) +
+  geom_boxplot() +
+  labs(title = "Altersverteilung: Baseline vs. Diagnose",
+       x = "Zeitpunkt",
+       y = "Alter",
+       fill = "Zeitpunkt") +
+  theme_minimal() +
+  scale_fill_manual(values = c("blue", "red")) +
+  theme(legend.position = "none",
+        text = element_text(size = 16),
+        axis.text = element_text(size = 14),
+        plot.title = element_text(size = 20, face = "bold"),
+        axis.title = element_text(size = 18))
+
+# Plots anzeigen
+print(plot1)
+print(plot2)
+print(plot3)
+
+# Plots speichern (optional)
+ggsave("age_histogram_percent.png", plot1, width = 12, height = 8, dpi = 300)
+ggsave("age_density_relative.png", plot2, width = 12, height = 8, dpi = 300)
+ggsave("age_boxplot.png", plot3, width = 12, height = 8, dpi = 300)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Count matches with other df_y
+
+for(IOI in IOIs) {
+  # Extract the vector of eids for the current IOI from the results list
+  current_eids <- results_list[[paste(IOI, "cancerreg", sep = "_")]]
+  
+  # Count how many of these eids are present in df_y_only
+  matches_count[IOI] <- sum(df_y_only$eid %in% current_eids)
+}
+
+# Print the counts
+print(matches_count)
+
+
+
+
+
+
+rows_with_C22 <- apply(df_cancerreg_icd10, 1, function(row) {
+  any(grepl("^C22", row))
+})
+
+# Extract 'eid's from these rows
+eids_with_C22 <- df_cancerreg_icd10$eid[rows_with_C22]
+
+# Step 3: Check which of these 'eid's are also in 'df_y_only'
+matching_eids <- eids_with_C22[eids_with_C22 %in% df_y_only$eid]
+
+# Step 4: Report the number of matching 'eid's
+print(paste("Number of matching 'eid's found:", length(matching_eids)))
+
+#write.csv(data.frame(current_eids), file.path(project, "data/dataframes/cancerreg_single.csv"))
+writeLines(as.character(current_eids), con = file.path(project_path, "data/dataframes/cancerreg_single.txt"))
+
+print(data.frame(current_eids))
+
+```
+
+
+
+
+
+
+
+```{r}
+setwd(project_path)
+load("data/dataframes/df_covariates.RData")
+df_covariates <- check_and_remove_withdrawals(df_covariates, df_withdrawals)
+df_covariates <- df_covariates %>% select(c(eid, SEX))
+
+sub_icd <- merge.data.frame(sub_icd, df_covariates, by = "eid")
+PCD <- as.data.frame(table(sub_icd$diag_icd10))
+names(PCD) <- c("Diagnosis", "Freq")
+piechart <- ggplot(PCD, aes(x = "", y = Freq, fill = Diagnosis)) +
+  geom_bar(width = 1, stat = "identity") +
+  coord_polar(theta = "y") +
+  theme_void() +
+  scale_fill_brewer(palette = "Pastel1") +  # Farbschema
+  ggtitle("ICD-10 Diagnosis Distribution") +
+  theme(plot.title = element_text(hjust = 0.5))
+
+ggsave(filename = file.path(supplement_visuals_dir, paste0("piechart_", DOI, "_diagnosis_distribution.png")), 
+       plot = piechart, width = 10, height = 8, bg= "white")
+ggsave(filename = file.path(supplement_visuals_dir, paste0("piechart_", DOI, "_diagnosis_distribution.svg")), 
+       plot = piechart, width = 10, height = 7, bg = "white")
+```
+
+```{r}
+setwd(project_path)
+load("data/dataframes/df_y_ecca.RData")
+
+load("data/dataframes/df_covariates.RData")
+df_covariates <- check_and_remove_withdrawals(df_covariates, df_withdrawals)
+df_covariates <- df_covariates %>% select(c(eid, SEX))
+load("data/dataframes/df_y_icca.RData")
+df_y_eids <- merge(df_y_ecca, df_y_icca, by= "eid")
+df_y_duplicated_eids <- df_y_eids$eid
+df_y_icca <- df_y_icca %>% filter(!eid %in% df_y_duplicated_eids)
+df_y_ecca <- df_y_ecca %>% filter(!eid %in% df_y_duplicated_eids)
+
+df_ecca_sex <- merge(df_y_ecca, df_covariates, by = "eid") %>% select(eid, SEX)
+
+ 
+PCD <- as.data.frame(table(df_ecca_sex$SEX))
+
+names(PCD) <- c("Sex", "Freq")
+# PCD <- PCD%>% mutate(Diagnosis = ifelse(Diagnosis == 1, "iCCa", Diagnosis ))
+# PCD <- PCD%>% mutate(Diagnosis = ifelse(Diagnosis == 2, "eCCa", Diagnosis ))
+
+# Assuming PCD is your dataframe with 'Diagnosis' and 'Freq' columns
+
+# Calculate the percentage for each diagnosis
+PCD <- PCD %>%
+  mutate(Percent = Freq / sum(Freq) * 100)  # Add a percentage column
+
+# Create the pie chart with both counts in the legend and percentages on the slices
+piechart <- ggplot(PCD, aes(x = "", y = Freq, fill = Sex)) +
+  geom_bar(width = 1, stat = "identity") +   # Bar plot for pie chart slices
+  coord_polar(theta = "y") +                 # Convert to polar coordinates (pie chart)
+  theme_void() +                             # Remove background and axes
+  scale_fill_manual(values = c("skyblue", "indianred2"),  # Define custom colors
+                    labels = paste(PCD$Sex, "\n", PCD$Freq, " cases")) +  # Custom legend labels
+  geom_text(aes(label = paste0(round(Percent, 1), "%")),   # Display percentage on slices
+            position = position_stack(vjust = 0.5),
+            size = 14) +  # Increase percentage text size
+  theme(
+    legend.title = element_text(size = 25),          # Increase legend title size
+    legend.text = element_text(size = 22),           # Increase legend text size
+    plot.title = element_text(size = 25, hjust = 0.5)  # Increase title size and center it
+  ) +
+  ggtitle("Sex Distribution eCCa")             # Adjust legend text size
+
+# Display the pie chart
+print(piechart)
+
+
+ggsave(filename = file.path(supplement_visuals_dir, paste0("piechart_", DOI, "_Sex_distribution_ecca.svg")), 
+       plot = piechart, width = 10, height = 8, bg= "transparent")
+
+```
+
+
+```{r}
+
+df_ecca_sex <- merge(df_y_ecca, df_covariates, by = "eid") %>% select(eid, SEX)
+
+ 
+PCD <- as.data.frame(table(df_ecca_sex$SEX))
+
+names(PCD) <- c("Sex", "Freq")
+# Calculate the percentage for each diagnosis
+PCD <- PCD %>%
+  mutate(Percent = Freq / sum(Freq) * 100)  # Add a percentage column
+
+# Create the pie chart with both counts in the legend and percentages on the slices
+piechart <- ggplot(PCD, aes(x = "", y = Freq, fill = Sex)) +
+  geom_bar(width = 1, stat = "identity") +   # Bar plot for pie chart slices
+  coord_polar(theta = "y") +                 # Convert to polar coordinates (pie chart)
+  theme_void() +                             # Remove background and axes
+  scale_fill_manual(values = c("indianred2", "skyblue"),  # Define custom colors
+                    labels = paste(PCD$Sex, "\n", PCD$Freq, " cases")) +  # Custom legend labels
+  geom_text(aes(label = paste0(round(Percent, 1), "%")),   # Display percentage on slices
+            position = position_stack(vjust = 0.5),
+            size = 14) +  # Increase percentage text size
+  theme(
+    legend.title = element_text(size = 25),          # Increase legend title size
+    legend.text = element_text(size = 22),           # Increase legend text size
+    plot.title = element_text(size = 25, hjust = 0.5)  # Increase title size and center it
+  ) +
+  ggtitle("Sex Distribution eCCa")            # Adjust legend text size
+
+# Display the pie chart
+print(piechart)
+
+
+ggsave(filename = file.path(supplement_visuals_dir, paste0("piechart_", DOI, "_Sex_distribution_ecca.svg")), 
+       plot = piechart, width = 10, height = 8, bg= "transparent")
+```
+```
+
